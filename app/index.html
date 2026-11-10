@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sruti Trainer</title>
+<meta name="description" content="Carnatic swara pitch trainer: sing and see instantly whether you're on the note.">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div id="app" class="app">
+  <header class="topbar">
+    <button id="saChip" class="chip sa-chip" aria-haspopup="menu">
+      <span class="sa-main"><span id="saName">Sa D3</span> <svg class="chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span>
+      <span class="sa-sub" id="saSub">kattai 2 · Mayamalavagowla</span>
+    </button>
+    <button id="exerciseChip" class="chip" aria-haspopup="menu"><span id="exerciseName">Free hold</span> <svg class="chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></button>
+    <div class="spacer"></div>
+    <span id="installHint" class="install-hint" hidden></span>
+    <button class="icon-btn" id="btnInstall" title="Install as an app" hidden>
+      <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0-5-5m5 5 5-5M5 21h14"/></svg>
+    </button>
+    <button class="icon-btn" id="btnGuide" title="How to use (?)" aria-label="How to use">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9.5"/><path d="M9.5 9.2a2.6 2.6 0 0 1 5 .9c0 1.8-2.5 2.2-2.5 3.9"/><circle cx="12" cy="17.2" r=".6" class="fill"/></svg>
+    </button>
+    <button class="icon-btn" id="btnHistory" title="History" aria-label="History">
+      <svg viewBox="0 0 24 24"><path d="M4 19h16M6 15l4-4 3 3 5-6"/></svg>
+    </button>
+    <button class="icon-btn" id="btnSettings" title="Settings" aria-label="Settings">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+    </button>
+    <button class="icon-btn" id="btnFullscreen" title="Full screen (F)" aria-label="Full screen">
+      <svg viewBox="0 0 24 24" id="fsIcon"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+    </button>
+  </header>
+
+  <main class="main">
+    <section class="graph-wrap">
+      <canvas id="graph" aria-label="Pitch graph"></canvas>
+      <div id="blindOverlay" class="blind-overlay" hidden>
+        <div class="ear">👂</div>
+        <div class="blind-title">Blind mode — sing by ear</div>
+        <div class="blind-sub">Pause to see how you did</div>
+      </div>
+    </section>
+
+    <section class="strip">
+      <div class="strip-line">
+        <span class="muted">You're singing</span>
+        <span id="singing" class="singing">—</span>
+        <span class="spacer"></span>
+        <button id="blindToggle" class="pill">Blind</button>
+      </div>
+      <div class="strip-cells" id="stripCells"></div>
+    </section>
+
+    <section id="picker" class="picker"></section>
+    <section id="exerciseBar" class="exercise-bar" hidden>
+      <div class="chips-scroll" id="chips"></div>
+      <div class="hold-progress" id="holdProgress" hidden><div class="hold-fill" id="holdFill"></div></div>
+      <div class="exercise-controls" id="exerciseControls"></div>
+    </section>
+  </main>
+
+  <aside class="side">
+    <section class="header-row">
+      <div class="target" id="target">
+        <div class="caption">Sing</div>
+        <div class="target-line">
+          <span id="targetName" class="target-name">Sa</span>
+          <button id="hearBtn" class="round-btn" title="Hear this note (H)" aria-label="Hear the note">
+            <svg viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4z" class="fill"/><path d="M16 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11"/></svg>
+          </button>
+        </div>
+        <div id="targetMeta" class="target-meta">D3 · 147 Hz · middle octave</div>
+      </div>
+      <div class="readout" id="readout"></div>
+    </section>
+
+    <section class="drone">
+      <div class="drone-row">
+        <button id="tanpuraToggle" class="pill toggle">♪ Tanpura</button>
+        <button id="guideToggle" class="pill toggle">⑂ Guide</button>
+        <input id="volume" type="range" min="0" max="1" step="0.01" aria-label="Tanpura volume">
+        <span id="routeIcon" class="route" title="Output"></span>
+      </div>
+      <div id="routeNote" class="route-note" hidden></div>
+    </section>
+
+    <section class="controls">
+      <div id="replayNote" class="replay-note" hidden></div>
+      <div id="errorNote" class="error-note" hidden></div>
+      <div id="permissionNote" class="permission-note" hidden>
+        <strong>Microphone access is off.</strong>
+        <span>Click the 🔒 / site-settings icon at the left of Chrome's address bar → Microphone → Allow, then reload.</span>
+      </div>
+      <button id="startBtn" class="start-btn">Start</button>
+      <div class="shortcut-hint">Space start/stop · F full screen · H hear the note</div>
+    </section>
+  </aside>
+
+  <div id="diag" class="diag" hidden></div>
+</div>
+
+<div id="popover" class="popover" hidden></div>
+<dialog id="sheet" class="sheet"></dialog>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
