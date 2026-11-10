@@ -1,8 +1,8 @@
 // App state and behaviour — a port of SrutiTrainer/App/AppState.swift. The UI (ui.js) reads from this and
 // calls its methods; `onChange` fires whenever something visible changed. Keep in step with Swift.
 import {
-  BUILT_IN_EXERCISES, raga, parseNotation, noteCents, noteLabel, Sruti, intonationCents, evaluateFeedback,
-  PracticeSession, PitchHistory, FreeHoldStats, SaFinder, centsText,
+  BUILT_IN_EXERCISES, raga, parseNotation, drillSequence, noteCents, noteLabel, Sruti, intonationCents, evaluateFeedback,
+  PracticeSession, PitchHistory, FreeHoldStats, SaFinder, centsText, DisplaySmoother,
 } from './music.js';
 import { AudioEngine, HOP } from './audio/engine.js';
 import { droneFrequencies, Style } from './dsp/tanpura.js';
@@ -14,6 +14,8 @@ const RESTART_KEYS = ['practiceMode', 'tempoBPM', 'tempoSpeed', 'guidedHoldSecon
 const clone = (o) => JSON.parse(JSON.stringify(o));
 
 export class AppState {
+  static drillGuideBreak = 0.35;
+
   constructor() {
     this.settings = loadSettings();
     this.freeTarget = { swara: 's', octave: 0 };
@@ -41,6 +43,7 @@ export class AppState {
     this.history = new PitchHistory();
     this.engine = new AudioEngine();
     this.freeHoldStats = new FreeHoldStats();
+    this.displaySmoother = new DisplaySmoother();
     this.voicedRunStart = null;
     this.frameCount = 0;
     this.fpsWindowStart = 0;
@@ -94,6 +97,7 @@ export class AppState {
 
   get target() {
     if (this.session?.currentStep) return this.session.currentStep.note;
+    if (this.exercise?.drillSeconds) return { swara: 's', octave: 0 };   // random practice starts on Sa
     const steps = this.exerciseSteps;
     if (steps.length) return steps[0].note;
     return this.freeTarget;
@@ -104,7 +108,7 @@ export class AppState {
   get notesPerBeat() { return this.settings.tempoSpeed === 3 ? 4 : (this.settings.tempoSpeed === 2 ? 2 : 1); }
 
   get exercisePreview() {
-    if (!this.exercise) return [];
+    if (!this.exercise || this.exercise.drillSeconds) return [];
     const s = this.settings;
     const guided = s.practiceMode !== 'tempo';
     const perCount = guided ? s.guidedHoldSeconds : 60 / s.tempoBPM / this.notesPerBeat;
@@ -195,6 +199,7 @@ export class AppState {
     this.frameCount = 0;
     this.fpsWindowStart = 0;
     this.voicedRunStart = null;
+    this.displaySmoother.reset();
     this.guideKeySent = undefined;
     this.syncGuide();
     this.requestWakeLock();
@@ -204,6 +209,8 @@ export class AppState {
   stop() {
     if (!this.isListening && !this.starting) return;
     this.saveFreeHoldRecord();
+    // Random practice runs until you stop: score what was sung so far.
+    if (this.session && this.exercise?.drillSeconds && this.session.results.length) this.finishSession(this.session);
     this.endSession();
     if (this.saFinder) this.cancelFindSa();
     this.engine.stop();
@@ -261,6 +268,17 @@ export class AppState {
     const steps = this.exerciseSteps;
     if (!this.exercise || !steps.length) return;
     const s = this.settings;
+    const seconds = this.exercise.drillSeconds;
+    if (seconds) {
+      // Random practice: Sa first, then a random swara from the pool every `seconds` (no click, no count-in).
+      const run = drillSequence(steps.map((x) => x.note), Math.floor(3600 / seconds) + 1);
+      this.session = new PracticeSession(run, {
+        mode: { kind: 'tempo', secondsPerCount: seconds, countIn: 0 }, intonation: s.intonation,
+        tolerance: { ...s.tolerance }, strict: s.strictPlainNotes, scoreFromFound: true, revealAhead: 1,
+      }, time);
+      this.syncGuide();
+      return;
+    }
     const beat = 60 / s.tempoBPM;
     let mode;
     if (s.practiceMode === 'tempo') {
@@ -309,7 +327,7 @@ export class AppState {
     }
     this.addRecord({
       date: Date.now(), exerciseID: exercise.id, exerciseName: exercise.name,
-      mode: this.settings.practiceMode === 'tempo' ? 'Tempo' : 'Guided',
+      mode: exercise.drillSeconds ? 'Random' : (this.settings.practiceMode === 'tempo' ? 'Tempo' : 'Guided'),
       inTuneFraction: summary.inTuneFraction, averageAbsError: summary.averageAbsError, averageSteadiness: summary.averageSteadiness,
       noteCount: summary.results.length, sungCount: summary.results.filter((r) => r.zone != null).length,
       worstNote: worst, durationSeconds: Math.max((this.latest?.time ?? 0) - finished.runStart, 0),
@@ -333,11 +351,11 @@ export class AppState {
 
   // MARK: Custom exercises
 
-  saveCustomExercise(id, name, notation, ragaID) {
+  saveCustomExercise(id, name, notation, ragaID, drillSeconds = null) {
     let ex = id ? this.customExercises.find((e) => e.id === id) : null;
-    if (ex) Object.assign(ex, { name, notation, ragaID });
+    if (ex) Object.assign(ex, { name, notation, ragaID, drillSeconds });
     else {
-      ex = { id: `custom-${crypto.randomUUID()}`, name, notation, ragaID, createdAt: Date.now() };
+      ex = { id: `custom-${crypto.randomUUID()}`, name, notation, ragaID, drillSeconds, createdAt: Date.now() };
       this.customExercises.push(ex);
     }
     saveCustomExercises(this.customExercises);
@@ -420,15 +438,35 @@ export class AppState {
     this.syncGuide();
   }
 
+  /** Random practice plays each note on the guide voice, with a short break before the next (even the same note). */
+  get drillGuideOn() {
+    const session = this.session;
+    if (!this.exercise?.drillSeconds || !session || session.phase !== 'running') return false;
+    const end = session.currentStepEnd, now = this.latest?.time;
+    if (end == null || now == null) return true;
+    return end - now > AppState.drillGuideBreak;
+  }
+
+  /** The note after the current one in random practice, and seconds until it. */
+  get drillNext() {
+    const session = this.session;
+    if (!this.exercise?.drillSeconds || !session || !session.nextStep) return null;
+    const end = session.currentStepEnd;
+    if (end == null) return null;
+    return { note: session.nextStep.note, inSeconds: Math.max(end - (this.latest?.time ?? session.stepStart), 0) };
+  }
+
   syncGuide() {
     const s = this.settings;
     const hz = this.targetHz;
-    this.engine.setParams({ guideOn: s.guideNote, guideHz: hz });
-    const key = JSON.stringify([s.guideNote ? hz : 0, s.droneOn, s.echoCancel, this.saHz, this.droneFrequencies, this.outputSealed]);
+    const isDrill = !!this.exercise?.drillSeconds;
+    this.engine.setParams({ guideOn: isDrill ? this.drillGuideOn : s.guideNote, guideHz: hz });
+    const guideAudible = s.guideNote || isDrill;
+    const key = JSON.stringify([guideAudible ? hz : 0, s.droneOn, s.echoCancel, this.saHz, this.droneFrequencies, this.outputSealed]);
     if (key === this.guideKeySent) return;
     this.guideKeySent = key;
     const audible = !this.outputSealed;
-    const pitches = [...(s.droneOn ? this.droneFrequencies : []), ...(s.guideNote ? [hz] : [])];
+    const pitches = [...(s.droneOn ? this.droneFrequencies : []), ...(guideAudible ? [hz] : [])];
     this.engine.setAnalysisContext({
       saHz: this.saHz,
       droneStrings: s.droneOn ? this.droneFrequencies : [],
@@ -455,7 +493,9 @@ export class AppState {
         session.process(frame.time, frame.hz != null ? Sruti.centsOfHz(sruti, frame.hz) : null);
         if (session.phase === 'finished') this.finishSession(session);
       }
-      this.history.append([frame], this.session?.phase === 'countIn' ? null : this.targetCents, arrival);
+      // What the eye sees (graph, readout, strip) is calmed; everything that scores uses frame.hz itself.
+      const shownHz = this.settings.pitchLine === 'detailed' ? frame.hz : this.displaySmoother.process(frame.hz, frame.time);
+      this.history.append([{ time: frame.time, hz: shownHz }], this.session?.phase === 'countIn' ? null : this.targetCents, arrival);
       if (frame.hz != null && !this.session && !this.exercise && !this.saFinder) {
         this.freeHoldStats.add(Sruti.centsOfHz(sruti, frame.hz) - this.targetCents, this.settings.tolerance);
       }
@@ -463,7 +503,7 @@ export class AppState {
       if (frame.hz != null) {
         const start = this.voicedRunStart ?? frame.time;
         this.voicedRunStart = start;
-        if (frame.time - start >= PitchHistory.minVoicedRun) { this.lastVoicedHz = frame.hz; this.lastVoicedTime = frame.time; }
+        if (frame.time - start >= PitchHistory.minVoicedRun) { this.lastVoicedHz = shownHz; this.lastVoicedTime = frame.time; }
       } else {
         this.voicedRunStart = null;
       }

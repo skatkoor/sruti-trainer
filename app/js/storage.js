@@ -7,7 +7,7 @@ const HISTORY_KEY = 'history.v1';
 
 export function defaultSettings() {
   return {
-    sruti: { midiNote: 50, fineTuneCents: 0 },
+    sruti: { midiNote: 48, fineTuneCents: 0 },   // C3 — the user's Sa (CLAUDE.md)
     intonation: 'just',
     ragaID: 'mayamalavagowla',
     tolerance: { green: 10, yellow: 25 },
@@ -29,6 +29,8 @@ export function defaultSettings() {
     strictPlainNotes: false,
     blindMode: false,
     recordSessions: false,
+    /** Pitch line and readout: 'calm' (smoothed for the eye) or 'detailed' (every wobble). */
+    pitchLine: 'calm',
   };
 }
 

@@ -68,6 +68,15 @@ export const BUILT_IN_EXERCISES = [
   { id: 'sarali-1', name: 'Sarali 1', notation: "s r g m | p d n s' | s' n d p | m g r s", ragaID: 'mayamalavagowla' },
 ];
 
+/** Random practice (Exercise.drillSeconds): Sa (middle) first, then `count − 1` random picks from `pool`. */
+export const DRILL_SECONDS_RANGE = [2, 30];
+export function drillSequence(pool, count, random = Math.random) {
+  const notes = [{ swara: 's', octave: 0 }];
+  if (!pool.length) return notes.map((note) => ({ note, counts: 1 }));
+  while (notes.length < count) notes.push(pool[Math.floor(random() * pool.length)]);
+  return notes.map((note) => ({ note: { ...note }, counts: 1 }));
+}
+
 // MARK: - Sruti & Western notes (Sruti.swift, WesternNote.swift)
 
 export const WESTERN = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -274,6 +283,13 @@ export class PracticeSession {
   }
 
   get currentStep() { return this.phase === 'finished' ? null : this.steps[this.index]; }
+  get nextStep() { return this.phase === 'finished' || this.index + 1 >= this.steps.length ? null : this.steps[this.index + 1]; }
+  /** Tempo mode: when the current note ends. */
+  get currentStepEnd() {
+    const step = this.currentStep;
+    if (this.config.mode.kind !== 'tempo' || !step) return null;
+    return this.stepStart + step.counts * this.config.mode.secondsPerCount;
+  }
   targetCents(step) { return noteCents(step.note, this.config.intonation); }
 
   get holdProgress() {
@@ -313,7 +329,7 @@ export class PracticeSession {
     const step = this.steps[this.index];
     const target = this.targetCents(step);
     let scored = this.stepVoiced;
-    if (this.config.mode.kind === 'guided') {
+    if (this.config.mode.kind === 'guided' || this.config.scoreFromFound) {
       const found = this.stepVoiced.findIndex((c) => Math.abs(c - target) <= PracticeSession.foundCents);
       if (found >= 0) scored = this.stepVoiced.slice(found);
     }
@@ -337,7 +353,8 @@ export class PracticeSession {
     const mode = this.config.mode;
     if (mode.kind === 'tempo') {
       let t = this.stepStart;
-      for (let i = this.index; i < this.steps.length; i++) {
+      const last = this.config.revealAhead != null ? Math.min(this.steps.length - 1, this.index + this.config.revealAhead) : this.steps.length - 1;
+      for (let i = this.index; i <= last; i++) {
         if (!(t < now + horizon || i <= this.index + 1)) continue;
         const end = t + this.steps[i].counts * mode.secondsPerCount;
         add(i, t, end);
@@ -463,6 +480,32 @@ export class PitchHistory {
   now(date, live) {
     if (!live || this.lastArrival == null) return this.lastTime;
     return this.lastTime + Math.min(Math.max(date - this.lastArrival, 0), 0.1);
+  }
+}
+
+// MARK: - Display smoother (DisplaySmoother.swift)
+
+/**
+ * Calms the pitch line and the readout for the eye: a voice wobbles a few cents many times a second, which the
+ * detector measures faithfully but nobody can follow by eye. A one-pole smoother in cents (τ ≈ 0.15 s) keeps the
+ * shape of the note — slides, a gamaka's swing, a drift sharp — without the shimmer. A real jump (a new note,
+ * > 150¢) is never smoothed into a glide. Scoring, Find my Sa and history always use the unsmoothed pitch.
+ */
+export class DisplaySmoother {
+  static timeConstant = 0.15;
+  constructor() { this.reset(); }
+  reset() { this.cents = null; this.lastTime = null; }
+  process(hz, time) {
+    if (hz == null) return null;
+    const c = 1200 * Math.log2(hz);
+    if (this.cents != null && this.lastTime != null && Math.abs(c - this.cents) < 150 && time - this.lastTime < 0.2) {
+      const a = 1 - Math.exp(-(time - this.lastTime) / DisplaySmoother.timeConstant);
+      this.cents += a * (c - this.cents);
+    } else {
+      this.cents = c;
+    }
+    this.lastTime = time;
+    return Math.pow(2, this.cents / 1200);
   }
 }
 

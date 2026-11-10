@@ -1,6 +1,6 @@
 // Service worker: caches the whole app so it opens instantly and works offline (and makes it installable).
 // VERSION is replaced with a content hash by Web/deploy.sh — every deploy gets a fresh cache.
-const VERSION = '41e6add92d76';
+const VERSION = '057c8b5145bc';
 const CACHE = `sruti-${VERSION}`;
 const FILES = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',

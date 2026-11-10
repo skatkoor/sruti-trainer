@@ -13,6 +13,7 @@ class SrutiProcessor extends AudioWorkletProcessor {
     this.analysis = null;
     this.mic = new Float32Array(BLOCK);
     this.ref = new Float32Array(BLOCK);
+    this.out = new Float32Array(BLOCK);
     this.fill = 0;
     this.sample = 0;
     this.drone = new Float32Array(128);
@@ -47,6 +48,8 @@ class SrutiProcessor extends AudioWorkletProcessor {
       }
       this.mic[this.fill] = v;
       this.ref[this.fill] = this.drone[i];
+      // Everything we play (tanpura, guide, pluck, click) — not a replayed recording.
+      this.out[this.fill] = replay ? 0 : ch0[i];
       if (++this.fill === BLOCK) this.flush();
     }
     for (let c = 1; c < out.length; c++) out[c].set(ch0);
@@ -59,8 +62,8 @@ class SrutiProcessor extends AudioWorkletProcessor {
 
   flush() {
     if (this.analysis) {
-      const mic = this.mic.slice(0, this.fill), ref = this.ref.slice(0, this.fill);
-      this.analysis.postMessage({ mic, ref, start: this.sample }, [mic.buffer, ref.buffer]);
+      const mic = this.mic.slice(0, this.fill), ref = this.ref.slice(0, this.fill), out = this.out.slice(0, this.fill);
+      this.analysis.postMessage({ mic, ref, out, start: this.sample }, [mic.buffer, ref.buffer, out.buffer]);
     }
     this.sample += this.fill;
     this.fill = 0;

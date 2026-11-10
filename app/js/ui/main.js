@@ -119,6 +119,7 @@ export class MainScreen {
     }
     items.push({ sep: true });
     items.push({ label: 'New exercise…', icon: '+', action: () => this.sheets.open('exercises', { startWithNew: true }) });
+    items.push({ label: 'New random practice…', icon: '⤮', action: () => this.sheets.open('exercises', { startWithDrill: true }) });
     items.push({ label: 'Manage exercises…', icon: '≡', action: () => this.sheets.open('exercises') });
     openMenu(anchor, items);
   }
@@ -173,8 +174,17 @@ export class MainScreen {
     const fb = st.feedbackHidden ? null : st.feedback;
     name.style.color = fb ? zoneColor(fb.zone) : '#fff';
     const session = st.session;
-    const progress = session && session.phase !== 'finished' ? ` · ${session.index + 1}/${session.steps.length}` : '';
-    $('targetMeta').textContent = `${westernNote(hz).name} · ${hz.toFixed(0)} Hz · ${Octave.plainName(st.target.octave)} octave${progress}`;
+    const meta = $('targetMeta');
+    const next = st.drillNext;
+    if (next) {
+      // Random practice: what's coming, so you can get ready while still holding this note.
+      meta.textContent = `Next: ${noteLabel(next.note)} · in ${Math.ceil(next.inSeconds)} s`;
+      meta.classList.add('next');
+    } else {
+      const progress = session && session.phase !== 'finished' ? ` · ${session.index + 1}/${session.steps.length}` : '';
+      meta.textContent = `${westernNote(hz).name} · ${hz.toFixed(0)} Hz · ${Octave.plainName(st.target.octave)} octave${progress}`;
+      meta.classList.remove('next');
+    }
     $('hearBtn').setAttribute('aria-label', `Hear ${Swara.name(st.target.swara)}`);
   }
 
@@ -327,7 +337,38 @@ export class MainScreen {
     el.appendChild(more);
   }
 
+  /** Random practice: the last few notes (coloured by score), the one to sing now, and the next one. */
+  renderDrillBar() {
+    const st = this.state, session = st.session, ex = st.exercise;
+    const recent = (session?.results ?? []).slice(-12);
+    const key = JSON.stringify([ex.id, session?.index ?? -1, recent.length, session ? 1 : 0]);
+    if (key !== this.chipsKey) {
+      this.chipsKey = key;
+      const chip = (note, cls, style = '', small = '') => `<div class="note-chip ${cls}" style="${style}">${small}${esc(noteLabel(note))}</div>`;
+      let html = recent.map((r) => chip(r.step.note, 'scored', `background:${r.zone ? zoneColor(r.zone) : 'rgba(142,142,147,0.85)'}`)).join('');
+      if (session?.currentStep) {
+        html += chip(session.currentStep.note, 'current');
+        if (session.nextStep) html += chip(session.nextStep.note, 'next-chip', '', '<span class="tiny">next</span>');
+      } else {
+        html += `<span class="muted" style="align-self:center">Starts on Sa, then a random swara every ${ex.drillSeconds} s</span>`;
+      }
+      const chips = $('chips');
+      chips.innerHTML = html;
+      chips.scrollLeft = chips.scrollWidth;
+    }
+    $('holdProgress').hidden = true;
+    const ckey = JSON.stringify(['drill', ex.id, ex.notation, ex.drillSeconds]);
+    if (ckey !== this.controlsKey) {
+      this.controlsKey = ckey;
+      const pool = st.exerciseSteps.map((x) => noteLabel(x.note)).join(' ');
+      const el = $('exerciseControls');
+      el.innerHTML = `<span class="muted">⤮ Random: ${esc(pool)} · ${ex.drillSeconds} s each</span><button class="pill" id="editDrill">Edit</button>`;
+      el.querySelector('#editDrill').addEventListener('click', () => this.sheets.open('drill', { existing: ex }));
+    }
+  }
+
   renderExerciseBar() {
+    if (this.state.exercise?.drillSeconds) { this.renderDrillBar(); return; }
     const st = this.state, s = st.settings, session = st.session;
     const steps = st.exerciseSteps;
     const current = session?.phase === 'finished' ? -1 : (session?.index ?? -1);

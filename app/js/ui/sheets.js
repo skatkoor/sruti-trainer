@@ -2,7 +2,7 @@
 // Ports of SettingsView, HistoryView, ExerciseListView, FindSaView, ResultsView and GuideView. Keep in step.
 import {
   Sruti, RAGAS, raga, Swara, noteLabel, parseNotation, BUILT_IN_EXERCISES, centsText, historyDays, startOfDay,
-  SaFinder, westernNote, signed,
+  SaFinder, westernNote, signed, sameNote, noteCents, DRILL_SECONDS_RANGE,
 } from '../music.js';
 import { zoneColor, inTuneColor, COLORS } from './palette.js';
 import { Recordings } from '../storage.js';
@@ -240,8 +240,9 @@ const VIEWS = {
         );
         body.append(g);
 
-        ({ g, card } = group('Display'));
+        ({ g, card } = group('Display', 'Calm smooths the line and the numbers for the eye (about a sixth of a second); scores always use the exact pitch.'));
         card.append(
+          selectRow(v, 'Pitch line', [{ value: 'calm', label: 'Calm (easier to follow)' }, { value: 'detailed', label: 'Detailed (every wobble)' }], () => st.settings.pitchLine, (x) => S((s) => { s.pitchLine = x; })),
           toggleRow(v, 'Show Hz error', () => st.settings.showHz, (x) => S((s) => { s.showHz = x; })),
           selectRow(v, 'Graph range', [{ value: 'auto', label: 'Auto (zooms to your singing)' }, { value: 'full', label: 'Full (−500…+1500¢)' }], () => st.settings.graphRange, (x) => S((s) => { s.graphRange = x; })),
           toggleRow(v, 'Show diagnostics line', () => st.settings.showDiagnostics, (x) => S((s) => { s.showDiagnostics = x; })),
@@ -460,13 +461,14 @@ const VIEWS = {
       build(body, v) {
         v.render(body);
         if (opts.startWithNew) { opts.startWithNew = false; setTimeout(() => sheets.open('editor', {}), 0); }
+        if (opts.startWithDrill) { opts.startWithDrill = false; setTimeout(() => sheets.open('drill', {}), 0); }
       },
       render(body) {
         body.innerHTML = '';
         const rowFor = (e, editable) => {
           const r = el('div', 'row');
           const pick = el('button', null, `<div style="font-weight:600">${esc(e.name)} ${st.exerciseID === e.id ? `<span style="color:${COLORS.inTune}">✓</span>` : ''}</div>`
-            + `<div class="muted" style="font: 12px ui-monospace, Menlo, monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis">${esc(e.notation)}</div>`);
+            + `<div class="muted" style="font: 12px ui-monospace, Menlo, monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis">${esc(e.drillSeconds ? `Random · ${e.drillSeconds} s each` : e.notation)}</div>`);
           pick.style.cssText = 'flex:1;text-align:left;min-width:0';
           pick.addEventListener('click', () => { st.setExercise(e.id); sheets.closeAll(); });
           r.append(pick);
@@ -474,7 +476,7 @@ const VIEWS = {
             const edit = el('button', 'link', '✎');
             edit.title = `Edit ${e.name}`;
             edit.style.fontSize = '18px';
-            edit.addEventListener('click', () => sheets.open('editor', { existing: e }));
+            edit.addEventListener('click', () => sheets.open(e.drillSeconds ? 'drill' : 'editor', { existing: e }));
             const del = el('button', 'link danger', '🗑');
             del.title = `Delete ${e.name}`;
             del.addEventListener('click', () => {
@@ -489,9 +491,10 @@ const VIEWS = {
         let { g, card } = group('Built in');
         for (const e of BUILT_IN_EXERCISES) card.append(rowFor(e, false));
         body.append(g);
-        ({ g, card } = group('My exercises', 'Type what your teacher gives you, e.g. “s r g m p ; ; ;”.'));
+        ({ g, card } = group('My exercises', 'Type what your teacher gives you, e.g. “s r g m p ; ; ;”. Random practice: pick a few swaras (say Sa, Da, Ni) and sing whichever comes up next.'));
         for (const e of st.customExercises) card.append(rowFor(e, true));
         card.append(linkRow('+ New exercise', () => sheets.open('editor', {})));
+        card.append(linkRow('⤮ New random practice', () => sheets.open('drill', {})));
         body.append(g);
       },
       refresh() { /* list re-renders when you come back from the editor (build) */ },
@@ -561,6 +564,111 @@ const VIEWS = {
     };
   },
 
+  // ----------------------------------------------------------------- Random practice editor (DrillEditorView)
+  drill(st, sheets, opts) {
+    const existing = opts.existing ?? null;
+    const r = st.raga;
+    const middle = [...r.swaras.map((sw) => ({ swara: sw, octave: 0 })), { swara: 's', octave: 1 }];
+    const lower = r.swaras.filter((sw) => ['p', 'd1', 'd2', 'd3', 'n1', 'n2', 'n3'].includes(sw)).map((sw) => ({ swara: sw, octave: -1 }));
+    let selected = existing ? parseNotation(existing.notation, r).steps.map((x) => x.note) : [{ swara: 's', octave: 0 }];
+    // Text, not a number, so it can be cleared and retyped freely; checked when saving.
+    let secondsText = String(existing?.drillSeconds ?? 5);
+    const ordered = () => [...selected].sort((a, b) => noteCents(a, 'equal') - noteCents(b, 'equal'));
+    const autoName = () => `Random: ${ordered().map(noteLabel).join(' ')}`;
+    let name = existing?.name ?? autoName();
+    let nameEdited = existing ? existing.name !== autoName() : false;
+    const seconds = () => {
+      const v = Number(secondsText.replace(',', '.'));
+      return secondsText.trim() !== '' && Number.isFinite(v) && v >= DRILL_SECONDS_RANGE[0] && v <= DRILL_SECONDS_RANGE[1] ? v : null;
+    };
+    const canSave = () => selected.length >= 1 && seconds() != null && name.trim().length > 0;
+    const notation = () => ordered().map((n) => (n.octave === -1 ? '.' : '') + n.swara + (n.octave === 1 ? "'" : '')).join(' ');
+    const save = (practise) => {
+      if (!canSave()) return;
+      const id = st.saveCustomExercise(existing?.id ?? null, name.trim(), notation(), null, seconds());
+      if (practise) { st.setExercise(id); sheets.closeAll(); } else sheets.close();
+    };
+    return {
+      title: existing ? 'Edit random practice' : 'New random practice',
+      left: { label: 'Cancel', action: () => sheets.close() },
+      right: { label: 'Save', action: () => save(false) },
+      modal: true,
+      build(body, v) {
+        let { g, card } = group('Swaras to practise', 'Starts on Sa, then picks one of these at random each time — the same one can come again. Each note plays so you can hear it; “Next” shows what’s coming.');
+        const gridRow = (title, notes) => {
+          const rowEl = el('div', 'row col');
+          rowEl.append(el('span', 'muted', title));
+          const grid = el('div', 'drill-grid');
+          for (const note of notes) {
+            const b = el('button', null, esc(noteLabel(note)));
+            const sync = () => {
+              const on = selected.some((x) => sameNote(x, note));
+              b.classList.toggle('on', on);
+              b.setAttribute('aria-pressed', String(on));
+            };
+            b.addEventListener('click', () => {
+              selected = selected.some((x) => sameNote(x, note)) ? selected.filter((x) => !sameNote(x, note)) : [...selected, note];
+              sync();
+              v.update();
+            });
+            sync();
+            grid.append(b);
+          }
+          rowEl.append(grid);
+          return rowEl;
+        };
+        card.append(gridRow('Middle', middle));
+        if (lower.length) card.append(gridRow('Lower', lower));
+        body.append(g);
+
+        ({ g, card } = group('Each note'));
+        const r2 = row(null);
+        const box = el('div', 'seconds');
+        const input = Object.assign(document.createElement('input'), { type: 'text', inputMode: 'decimal', value: secondsText });
+        input.setAttribute('aria-label', 'Seconds per note');
+        input.addEventListener('input', () => { secondsText = input.value; v.update(); });
+        const stepBy = (d) => {
+          const cur = seconds() ?? 5;
+          secondsText = String(Math.min(DRILL_SECONDS_RANGE[1], Math.max(DRILL_SECONDS_RANGE[0], Math.round(cur + d))));
+          input.value = secondsText;
+          v.update();
+        };
+        const minus = el('button', null, '−'), plus = el('button', null, '+');
+        minus.setAttribute('aria-label', 'Fewer seconds');
+        plus.setAttribute('aria-label', 'More seconds');
+        minus.addEventListener('click', () => stepBy(-1));
+        plus.addEventListener('click', () => stepBy(1));
+        box.append(input, el('span', null, 'seconds'), minus, plus);
+        v.secondsError = el('span', 'danger', '');
+        r2.append(box, v.secondsError);
+        card.append(r2);
+        body.append(g);
+
+        ({ g, card } = group('Name'));
+        const nameInput = Object.assign(document.createElement('input'), { type: 'text', value: name });
+        nameInput.addEventListener('input', () => { name = nameInput.value; nameEdited = true; v.update(); });
+        v.nameInput = nameInput;
+        const r3 = row(null);
+        r3.append(nameInput);
+        card.append(r3);
+        body.append(g);
+
+        v.practise = el('button', 'primary-btn', 'Save & practise');
+        v.practise.addEventListener('click', () => save(true));
+        body.append(v.practise);
+        v.update();
+      },
+      update() {
+        if (!nameEdited) { name = autoName(); this.nameInput.value = name; }
+        this.secondsError.textContent = seconds() == null ? 'Enter 2 to 30 seconds' : '';
+        const ok = canSave();
+        this.rightButton.disabled = !ok;
+        this.practise.disabled = !ok;
+        this.practise.style.opacity = ok ? '1' : '0.4';
+      },
+    };
+  },
+
   // ----------------------------------------------------------------- Guide
   guide(st, sheets) {
     const done = () => { st.updateSettings((s) => { s.hasSeenGuide = true; }); sheets.close(); };
@@ -599,7 +707,8 @@ const VIEWS = {
 <section><h3>≡ Exercises</h3><ul>
 <li>Click <b>Free hold ▾</b> at the top and choose Hold Sa, Sa Pa Sa or Sarali 1 — or make your own.</li>
 <li><b>Guided</b> moves to the next note once you've held the current one in tune. <b>Tempo</b> moves on the beat with a click.</li>
-<li><b>Blind</b> hides your pitch while you sing and shows it when you pause — it trains your ear.</li></ul></section>
+<li><b>Blind</b> hides your pitch while you sing and shows it when you pause — it trains your ear.</li>
+<li><b>New random practice…</b>: pick a few swaras (say Sa, Da, Ni) and how many seconds each. It starts on Sa, then plays a random one of them each time and shows <b>Next</b> so you can get ready.</li></ul></section>
 <section><h3>⌨ Keyboard</h3><ul>
 <li><kbd>Space</kbd> start / stop · <kbd>F</kbd> full screen · <kbd>H</kbd> hear the note</li>
 <li><kbd>1</kbd>–<kbd>8</kbd> or <kbd>←</kbd> <kbd>→</kbd> pick a swara (free hold) · <kbd>T</kbd> tanpura · <kbd>G</kbd> guide · <kbd>B</kbd> blind · <kbd>?</kbd> this guide</li></ul></section>

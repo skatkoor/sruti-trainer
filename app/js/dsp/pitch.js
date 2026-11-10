@@ -16,6 +16,10 @@ export const VoicingGate = {
   onsetToleranceCents: 60.0,
   droneSettleSeconds: 0.5,
   droneOnlySeconds: 0.5,
+  /** With our own sound reaching the mic: how far the note's harmonics must stand above what the played sound
+   *  explains (OwnSoundDetector.voiceExcessDB) to start / keep a note. */
+  ownStartDB: 0.0,
+  ownHoldDB: -6.0,
 
   /** Where a singer with this Sa can plausibly be: from just below mandra Sa to above tara Pa. */
   searchRange(saHz) {
@@ -374,6 +378,10 @@ export class DroneCanceller {
     this.coherenceAlpha = 1 - Math.exp(-1 / (0.3 * sampleRate));
     this.followAlpha = 1 - Math.exp(-1 / (0.15 * sampleRate));
     this.minCoherence = 0.9;
+    /** No learning until the coherence averages hold this much audio: with only a few samples averaged,
+     *  any sound looks perfectly coherent with the drone (and a voice would be learned as leak). */
+    this.warmupSamples = Math.round(0.3 * sampleRate);
+    this.samplesSeen = 0;
     this._frequencies = [];
     this.count = 0;
   }
@@ -401,6 +409,7 @@ export class DroneCanceller {
     }
     const n = unique.length;
     this.count = n;
+    this.samplesSeen = 0;
     this.hz = Float64Array.from(unique);
     const z = () => new Float64Array(n);
     this.stepRe = z(); this.stepIm = z();
@@ -448,6 +457,8 @@ export class DroneCanceller {
     const P = this.count;
     if (P === 0) return;
     const s = this.shortAlpha, ca = this.coherenceAlpha, fa = this.followAlpha, minC = this.minCoherence;
+    const warm = this.samplesSeen >= this.warmupSamples;
+    this.samplesSeen += count;
     const { oscRe, oscIm, stepRe, stepIm, m1Re, m1Im, mRe, mIm, r1Re, r1Im, rRe, rIm, smrRe, smrIm, smm, srr,
       hRe, hIm, slrRe, slrIm, sll } = this;
     for (let n = 0; n < count; n++) {
@@ -466,7 +477,7 @@ export class DroneCanceller {
         const mm = (smm[i] += ca * (mr * mr + mi * mi - smm[i]));
         const r2 = (srr[i] += ca * (rr * rr + ri * ri - srr[i]));
         const cross2 = sR * sR + sI * sI;
-        if (!singing && r2 > 1e-14 && cross2 >= minC * mm * r2) {
+        if (warm && !singing && r2 > 1e-14 && cross2 >= minC * mm * r2) {
           hRe[i] += fa * (sR / r2 - hRe[i]);
           hIm[i] += fa * (sI / r2 - hIm[i]);
         }
@@ -493,6 +504,152 @@ export class DroneCanceller {
       const m = 1 / Math.sqrt(oscRe[i] * oscRe[i] + oscIm[i] * oscIm[i]);
       oscRe[i] *= m; oscIm[i] *= m;
     }
+  }
+}
+
+// MARK: - Own-sound detector (OwnSoundDetector.swift)
+
+/**
+ * Is a candidate note really someone singing, or only the app's own output (tanpura, guide note, "hear"
+ * pluck, click) reaching the mic — AirPods turned up next to the mic, a laptop speaker, a room's echoes?
+ * See OwnSoundDetector.swift for the full description; this is a line-for-line port.
+ */
+export class OwnSoundDetector {
+  static holdSeconds = 0.6;
+  /** Allowance for how unevenly a room passes different frequencies, where only the overall level is known… */
+  static headroomDB = 9;
+  /** …and where the level at that very frequency has been learned (the steady tanpura's bins). */
+  static binHeadroomDB = 6;
+  /** Played energy within this of the loudest played bin counts as "something we play here"… */
+  static playedRangeDB = 45;
+  /** …and within this, loud enough to learn the path from. */
+  static learnRangeDB = 25;
+
+  constructor(sampleRate, windowSize = 2048, hopSize = 512) {
+    let size = 1;
+    while (size < windowSize * 2) size <<= 1;
+    this.fftSize = size;
+    this.windowSize = windowSize;
+    this.bins = size / 2 + 1;
+    this.binHz = sampleRate / size;
+    this.lo = Math.max(1, Math.floor(60 / this.binHz));
+    this.hi = Math.min(this.bins - 1, Math.floor(5000 / this.binHz));
+    this.fft = new FFT(size);
+    this.re = new Float64Array(size);
+    this.im = new Float64Array(size);
+    const hopSeconds = hopSize / sampleRate;
+    this.hopSeconds = hopSeconds;
+    this.decay = Math.pow(10, -4 * hopSeconds / OwnSoundDetector.holdSeconds);   // −40 dB over holdSeconds
+    this.riseAlpha = 1 - Math.exp(-hopSeconds / 0.15);
+    this.fallAlpha = 1 - Math.exp(-hopSeconds / 3.0);
+    this.window = new Float32Array(windowSize);
+    for (let i = 0; i < windowSize; i++) this.window[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / windowSize);
+    this.peak = new Float64Array(this.bins);
+    this.mic = new Float64Array(this.bins);
+    this.playedPower = new Float64Array(this.bins);
+    this.localFloor = new Float64Array(this.bins);
+    this.binGain = new Float64Array(this.bins).fill(-1);
+    this.binHops = new Int32Array(this.bins);
+    this.minBinHops = Math.ceil(0.3 / hopSeconds);
+    this.peakMax = 0;
+    this.activeHops = 0;
+    this.gainDB = null;
+  }
+
+  reset() { this.peak.fill(0); this.peakMax = 0; this.activeHops = 0; this.gainDB = null; this.binGain.fill(-1); this.binHops.fill(0); }
+
+  get isActive() { return this.peakMax > 1e-9; }
+
+  spectrum(samples, out) {
+    const N = this.fftSize, W = this.windowSize, re = this.re, im = this.im, win = this.window;
+    for (let i = 0; i < W; i++) { re[i] = Math.fround(samples[i] * win[i]); im[i] = 0; }
+    for (let i = W; i < N; i++) { re[i] = 0; im[i] = 0; }
+    this.fft.transform(re, im, false);
+    for (let k = 0; k < this.bins; k++) out[k] = 4 * (re[k] * re[k] + im[k] * im[k]);
+  }
+
+  /** Once per hop: the last windowSize samples that were played and the raw mic window (same sample clock). */
+  update(played, micRaw) {
+    this.spectrum(micRaw, this.mic);
+    let any = false;
+    for (let i = 0; i < this.windowSize; i++) if (played[i] !== 0) { any = true; break; }
+    this.activeHops = any ? this.activeHops + 1 : 0;
+    const peak = this.peak, lo = this.lo, hi = this.hi;
+    let max = 0;
+    if (!any) {
+      for (let k = 0; k < this.bins; k++) { peak[k] *= this.decay; if (k >= lo && k <= hi && peak[k] > max) max = peak[k]; }
+      this.peakMax = max;
+      return;
+    }
+    const p = this.playedPower;
+    this.spectrum(played, p);
+    for (let k = 0; k < this.bins; k++) {
+      const held = peak[k] * this.decay;
+      peak[k] = p[k] > held ? p[k] : held;
+      if (k >= lo && k <= hi && peak[k] > max) max = peak[k];
+    }
+    this.peakMax = max;
+  }
+
+  /** Every hop: how loud the played sound comes back at the mic, away from the voice's harmonics (`voiceHz`). */
+  learn(voiceHz) {
+    if (!this.isActive || this.activeHops * this.hopSeconds < OwnSoundDetector.holdSeconds) return;
+    // Broadband background (car, fan) per bin: the quietest mic bin nearby, between the tanpura's partials.
+    const mic = this.mic, lf = this.localFloor;
+    for (let k = this.lo; k <= this.hi; k++) {
+      let m = mic[k];
+      for (let j = Math.max(this.lo, k - 4), e = Math.min(this.hi, k + 4); j <= e; j++) if (mic[j] < m) m = mic[j];
+      lf[k] = m;
+    }
+    const floor = this.peakMax * Math.pow(10, -OwnSoundDetector.learnRangeDB / 10);
+    const ratios = [];
+    let next = 1;
+    let k = this.lo;
+    while (k <= this.hi) {
+      if (voiceHz != null) {
+        const c = next * voiceHz / this.binHz, w = 2.5 + 0.03 * c;
+        if (k > c + w) { next += 1; continue; }
+        if (k >= c - w) { k += 1; continue; }
+      }
+      // Where the mic clearly hears it: how loud it comes back (background off). A strong played bin lost in the
+      // background (headphones): it comes back no louder than the background.
+      if (this.peak[k] >= floor) {
+        const ratio = this.mic[k] > 2 * lf[k] ? (this.mic[k] - lf[k]) / this.peak[k] : Math.max(lf[k], 1e-30) / this.peak[k];
+        ratios.push(10 * Math.log10(ratio));
+        const b = this.binGain[k];
+        this.binGain[k] = b < 0 ? ratio : b + (ratio - b) * (ratio > b ? this.riseAlpha : this.fallAlpha);
+        this.binHops[k] += 1;
+      }
+      k += 1;
+    }
+    if (ratios.length < 4) return;
+    ratios.sort((a, b) => a - b);
+    const q = ratios[Math.floor(ratios.length * 0.75)];
+    if (this.gainDB == null) this.gainDB = q;
+    else this.gainDB += (q - this.gainDB) * (q > this.gainDB ? this.riseAlpha : this.fallAlpha);
+  }
+
+  /** At the harmonics of `hz`: raw mic energy beyond what the played sound and background explain (dB). */
+  voiceExcessDB(hz, noise, fundamentalOnly = false) {
+    if (!this.isActive) return Infinity;
+    const g = Math.pow(10, ((this.gainDB ?? 0) + OwnSoundDetector.headroomDB) / 10);
+    const binHeadroom = Math.pow(10, OwnSoundDetector.binHeadroomDB / 10);
+    let excess = 0, background = 0;
+    for (let h = 1; h * hz < 5000 && (!fundamentalOnly || h === 1); h++) {
+      const c = h * hz / this.binHz;
+      const w = 1.5 + 0.02 * c;
+      const a = Math.max(this.lo, Math.floor(c - w)), b = Math.min(this.hi, Math.ceil(c + w));
+      for (let k = a; k <= b; k++) {
+        const n = noise[k];
+        const bg = this.binGain[k];
+        // A bin's own value only once learned for a while; never below the overall level − 9 dB.
+        const trusted = this.binHops[k] >= this.minBinHops;
+        const explained = Math.max(2 * n, this.peak[k] * (trusted ? Math.max(bg * binHeadroom, g / 8) : g));
+        if (this.mic[k] > explained) excess += this.mic[k] - explained;
+        background += n;
+      }
+    }
+    return 10 * Math.log10(Math.max(excess, 1e-30) / Math.max(background, 1e-30));
   }
 }
 
@@ -533,6 +690,12 @@ export class PitchAnalyzer {
     this.history = new Float32Array(windowSize);
     this.clean = new Float32Array(windowSize);
     this.chunk = new Float32Array(1024);
+    this.own = new OwnSoundDetector(sampleRate, windowSize, hopSize);
+    this.playedHistory = new Float32Array(windowSize);
+    this.rawHistory = new Float32Array(windowSize);
+    this.rawChunk = new Float32Array(1024);
+    this.playedChunk = new Float32Array(1024);
+    this.ownDB = Infinity;
     this.filled = 0;
     this.sinceHop = 0;
     this.totalSamples = 0;
@@ -556,7 +719,8 @@ export class PitchAnalyzer {
   }
 
   reset() {
-    this.smoother.reset(); this.suppressor.reset(); this.canceller.reset();
+    this.smoother.reset(); this.suppressor.reset(); this.canceller.reset(); this.own.reset();
+    this.playedHistory.fill(0); this.rawHistory.fill(0);
     for (const b of this.highPass) b.reset();
     this.filled = 0; this.sinceHop = 0; this.lastVoicedHz = null; this.lastVoicedTime = -Infinity;
     this.onset = []; this.droneOnlyFrames = 0;
@@ -576,8 +740,10 @@ export class PitchAnalyzer {
     for (let i = 0; i < this.highPass.length && i < old.length; i++) this.highPass[i].copyState(old[i]);
   }
 
-  /** Feeds consecutive mic samples (Float32Array); `reference` (same length) is the aligned drone or null. */
-  process(samples, reference = null) {
+  /** Feeds consecutive mic samples (Float32Array). `reference` (same length): the drone as played, delayed to
+   *  line up with the mic (for the canceller), or null. `played`: everything the app played (drone, guide note,
+   *  pluck, click) at the *same* sample indices as the mic, undelayed (for OwnSoundDetector), or null. */
+  process(samples, reference = null, played = null) {
     const frames = [];
     const count = samples.length, chunk = this.chunk;
     let i = 0;
@@ -589,12 +755,16 @@ export class PitchAnalyzer {
         for (let s = 0; s < hp.length; s++) x = hp[s].process(x);
         chunk[j] = x;
       }
+      this.rawChunk.set(chunk.subarray(0, n));
       if (reference && this.canceller.isActive) {
         const singing = (this.lastVoicedHz != null
           && this.totalSamples / this.sampleRate - this.lastVoicedTime <= VoicingGate.memorySeconds)
           || this.onset.length > 0;
         this.canceller.process(chunk, 0, reference, i, n, singing);
       }
+      const pc = this.playedChunk;
+      if (played) for (let j = 0; j < n; j++) pc[j] = played[i + j];
+      else pc.fill(0, 0, n);
       this.append(n);
       i += n;
       this.sinceHop += n;
@@ -608,13 +778,17 @@ export class PitchAnalyzer {
   }
 
   append(n) {
-    const h = this.history, W = this.windowSize;
+    const h = this.history, ph = this.playedHistory, rh = this.rawHistory, W = this.windowSize;
     if (this.filled + n > W) {
       const drop = this.filled + n - W;
       h.copyWithin(0, drop, this.filled);
+      ph.copyWithin(0, drop, this.filled);
+      rh.copyWithin(0, drop, this.filled);
       this.filled -= drop;
     }
     h.set(this.chunk.subarray(0, n), this.filled);
+    ph.set(this.playedChunk.subarray(0, n), this.filled);
+    rh.set(this.rawChunk.subarray(0, n), this.filled);
     this.filled += n;
   }
 
@@ -627,15 +801,20 @@ export class PitchAnalyzer {
     const continuing = this.lastVoicedHz != null && time - this.lastVoicedTime <= VoicingGate.memorySeconds;
     const freeze = continuing ? this.lastVoicedHz : (this.onset.length ? this.onset[this.onset.length - 1] : null);
     const stats = this.suppressor.process(h, this.clean, freeze);
+    this.own.update(this.playedHistory, this.rawHistory);
     const result = this.detector.detect(this.clean);
     const trackDip = continuing ? this.detector.dip(this.lastVoicedHz) : null;
+    this.ownDB = Infinity;
     const [gate, chosen] = this.voicing(result, trackDip, continuing, rmsDB, stats.snrDB);
     if (gate === Gate.voiced && chosen) { this.lastVoicedHz = chosen.hz; this.lastVoicedTime = time; }
+    // Learn how loudly our own sound comes back at the mic (away from the voice's harmonics).
+    const voiceHz = gate === Gate.voiced && chosen ? chosen.hz : (continuing ? this.lastVoicedHz : (this.onset.length ? this.onset[this.onset.length - 1] : null));
+    this.own.learn(voiceHz);
     const smoothed = this.smoother.process(gate === Gate.voiced && chosen ? chosen.hz : null);
     const shown = chosen ?? result;
     return {
       time, hz: smoothed, rawHz: shown ? shown.hz : null, confidence: shown ? shown.confidence : 0,
-      rms, rmsDB, gate, snrDB: stats.snrDB, noiseDB: stats.noiseDBFS,
+      rms, rmsDB, gate, snrDB: stats.snrDB, noiseDB: stats.noiseDBFS, ownDB: this.ownDB,
     };
   }
 
@@ -643,14 +822,18 @@ export class PitchAnalyzer {
     const canStart = VoicingGate.isLoudEnoughToStart(rmsDB, snrDB);
     const canHold = VoicingGate.isLoudEnoughToHold(rmsDB, snrDB);
     const clear = result ? result.confidence >= VoicingGate.minConfidence : false;
-    const lf = this.leakFilter;
+    // When we know everything that was played (OwnSoundDetector), it alone decides what is our own sound: the
+    // older drone-pitch rules below misjudge in echoey rooms and with Bluetooth delay. They stay for when
+    // only the drone reference is known.
+    const lf = this.own.isActive ? null : this.leakFilter;
 
     if (continuing && trackDip && this.isDroneOnly(trackDip.hz)) this.droneOnlyFrames += 1;
     else this.droneOnlyFrames = 0;
     const droneOnly = this.droneOnlyFrames >= Math.trunc(VoicingGate.droneOnlySeconds * this.sampleRate / this.hopSize);
     if (continuing && canHold && !droneOnly && trackDip && trackDip.confidence >= VoicingGate.holdConfidence
       && !(lf ? lf.hasFadedIntoLeak(trackDip.hz, snrDB) : false)
-      && !this.onlyDroneResidue(trackDip.hz, lf ? lf.holdOverDroneDB : null)) {
+      && !this.onlyDroneResidue(trackDip.hz, lf ? lf.holdOverDroneDB : null)
+      && !this.isOwnSound(trackDip.hz, VoicingGate.ownHoldDB)) {
       this.onset = [];
       if (clear && canStart && result && !PitchAnalyzer.isOctaveBelow(result.hz, trackDip.hz)) return [Gate.voiced, result];
       return [Gate.voiced, trackDip];
@@ -666,6 +849,10 @@ export class PitchAnalyzer {
       this.onset = [];
       return [Gate.leak, r];
     }
+    if (this.isOwnSound(r.hz, VoicingGate.ownStartDB)) {
+      this.onset = [];
+      return [Gate.leak, r];
+    }
     this.onset.push(r.hz);
     if (this.onset.length > VoicingGate.onsetFrames) this.onset.shift();
     if (this.onset.length !== VoicingGate.onsetFrames) return [Gate.unclear, r];
@@ -675,14 +862,22 @@ export class PitchAnalyzer {
     return [Gate.voiced, r];
   }
 
+  /** Nothing at this pitch's harmonics beyond what the app itself is playing (see OwnSoundDetector). */
+  isOwnSound(hz, threshold) {
+    if (!this.own.isActive) return false;
+    const db = this.own.voiceExcessDB(hz, this.suppressor.noise);
+    this.ownDB = db;
+    return db < threshold;
+  }
+
   isDroneOnly(hz) {
-    const lf = this.leakFilter;
+    const lf = this.own.isActive ? null : this.leakFilter;
     if (!lf || !this.canceller.isActive || !lf.isDronePitch(hz)) return false;
     return this.canceller.isDroneOnly(hz);
   }
 
   onlyDroneResidue(hz, threshold) {
-    const lf = this.leakFilter;
+    const lf = this.own.isActive ? null : this.leakFilter;
     if (threshold == null || !lf || !this.canceller.isActive || !lf.isDronePitch(hz)) return false;
     const over = this.canceller.voiceOverDroneDB(hz);
     if (over == null) return false;
@@ -692,7 +887,11 @@ export class PitchAnalyzer {
   plausibleStart(r, snrDB) {
     const sa = this._saHz;
     if (!(sa != null && r.hz < 0.7 * sa)) return true;
-    return r.confidence >= 0.82 && snrDB >= 6;
+    if (!(r.confidence >= 0.82 && snrDB >= 6)) return false;
+    // With our own sound in the mic, YIN can read a voice an octave (or a fifth) low, on the tanpura's low Sa,
+    // whose harmonics include the voice's: down here, the fundamental itself must carry voice.
+    if (!this.own.isActive) return true;
+    return this.own.voiceExcessDB(r.hz, this.suppressor.noise, true) >= VoicingGate.ownStartDB;
   }
 
   static isOctaveBelow(hz, reference) { return Math.abs(1200 * Math.log2(reference / hz) - 1200) <= 150; }

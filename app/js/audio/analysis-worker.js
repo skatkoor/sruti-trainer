@@ -27,7 +27,7 @@ function applyContext() {
   analyzer.leakFilter = context.echoCancel && context.leakPitches.length ? new DroneLeakFilter(context.leakPitches) : null;
 }
 
-function onBlock({ mic, ref, start }) {
+function onBlock({ mic, ref, out, start }) {
   if (!analyzer) return;
   ring.write(mic);
   refRing.write(ref);
@@ -46,7 +46,9 @@ function onBlock({ mic, ref, start }) {
     if (refChunk.length !== n) refChunk = new Float32Array(n);
     if (refRing.copy(n, end - lag, refChunk)) reference = refChunk;
   }
-  const frames = analyzer.process(mic, reference);
+  // Everything played at these very samples, for OwnSoundDetector (which allows for any delay itself).
+  const played = !replaying && context.echoCancel ? out : null;
+  const frames = analyzer.process(mic, reference, played);
   for (const f of frames) pending.push(f);
   const now = end / sampleRate;
   if (pending.length && now - lastPublish >= 1 / 60) {
